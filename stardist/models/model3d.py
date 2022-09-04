@@ -1,5 +1,7 @@
 from __future__ import print_function, unicode_literals, absolute_import, division
 
+import n2v
+
 import numpy as np
 import warnings
 import math
@@ -334,6 +336,8 @@ class StarDist3D(StarDistBase):
             return self._build_unet()
         elif self.config.backbone == "resnet":
             return self._build_resnet()
+        elif self.config.backbone == "n2v":
+            return self.build_n2v()
         else:
             raise NotImplementedError(self.config.backbone)
 
@@ -379,6 +383,50 @@ class StarDist3D(StarDistBase):
         else:
             return Model([input_img], [output_prob,output_dist])
 
+    def get_output_layer(model, layer_name):
+        # get the symbolic outputs of each "key" layer (we gave them unique names).
+        layer_dict = dict([(layer.name, layer) for layer in model.layers])
+        layer = layer_dict[layer_name]
+        return layer
+
+    def _build_n2v(self):
+        assert self.config.backbone == 'n2v'
+        unet_kwargs = {k[len('unet_'):]:v for (k,v) in vars(self.config).items() if k.startswith('unet_')}
+
+        model = N2V(config=None, name=self.config.model_name, basedir=self.config.basedir)
+        model.load_weights("weights_best.h5")
+        
+        kerasmodel = model.keras_model
+        last_unet_layer = get_output_layer(kerasmodel, "channel_0up_level_0_no_"+str(self.config.unet_n_conv_per_depth))
+        first_unet_layer = get_output_layer(kerasmodel, "input")
+        unet_base = K.function([first_unet_layer.input], [last_unet_layer.output])
+
+        
+        #input_img = Input(self.config.net_input_shape, name='input')
+
+        #unet_base = unet_block(**unet_kwargs)(input_img)
+        
+        if self.config.net_conv_after_unet > 0:
+            unet = Conv3D(self.config.net_conv_after_unet, self.config.unet_kernel_size,
+                          name='features', padding='same', activation=self.config.unet_activation)(unet_base)
+        else:
+            unet = unet_base
+
+        output_prob = Conv3D(                 1, (1,1,1), name='prob', padding='same', activation='sigmoid')(unet)
+        output_dist = Conv3D(self.config.n_rays, (1,1,1), name='dist', padding='same', activation='linear')(unet)
+
+        # attach extra classification head when self.n_classes is given
+        if self._is_multiclass():
+            if self.config.net_conv_after_unet > 0:
+                unet_class  = Conv3D(self.config.net_conv_after_unet, self.config.unet_kernel_size,
+                                     name='features_class', padding='same', activation=self.config.unet_activation)(unet_base)
+            else:
+                unet_class  = unet_base
+
+            output_prob_class  = Conv3D(self.config.n_classes+1, (1,1,1), name='prob_class', padding='same', activation='softmax')(unet_class)
+            return Model([input_img], [output_prob,output_dist,output_prob_class])
+        else:
+            return Model([input_img], [output_prob,output_dist])
 
     def _build_resnet(self):
         assert self.config.backbone == 'resnet'
