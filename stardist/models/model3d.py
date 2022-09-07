@@ -1,6 +1,6 @@
 from __future__ import print_function, unicode_literals, absolute_import, division
 
-import n2v
+from n2v.models import N2VConfig, N2V
 
 import numpy as np
 import warnings
@@ -195,7 +195,7 @@ class Config3D(BaseConfig):
         .. _ReduceLROnPlateau: https://keras.io/api/callbacks/reduce_lr_on_plateau/
     """
 
-    def __init__(self, axes='ZYX', rays=None, n_channel_in=1, grid=(1,1,1), n_classes=None, anisotropy=None, backbone='unet', **kwargs):
+    def __init__(self, axes='ZYX', rays=None, n_channel_in=1, grid=(1,1,1), n_classes=None, anisotropy=None, backbone='n2v', **kwargs):
 
         if rays is None:
             if 'rays_json' in kwargs:
@@ -217,6 +217,7 @@ class Config3D(BaseConfig):
         self.rays_json                 = rays.to_json()
         self.n_classes                 = None if n_classes is None else int(n_classes)
 
+
         if 'anisotropy' in self.rays_json['kwargs']:
             if self.rays_json['kwargs']['anisotropy'] is None and self.anisotropy is not None:
                 self.rays_json['kwargs']['anisotropy'] = self.anisotropy
@@ -225,7 +226,10 @@ class Config3D(BaseConfig):
                 warnings.warn("Mismatch of 'anisotropy' of rays and 'anisotropy'.")
 
         # default config (can be overwritten by kwargs below)
-        if self.backbone == 'unet':
+        if self.backbone == 'n2v':
+            self.n2vmodel_name = "my_model"
+            self.n2vbasedir = "models"
+        if self.backbone == 'unet' or self.backbone == 'n2v':
             self.unet_n_depth            = 2
             self.unet_kernel_size        = 3,3,3
             self.unet_n_filter_base      = 32
@@ -328,7 +332,9 @@ class StarDist3D(StarDistBase):
 
     def __init__(self, config=Config3D(), name=None, basedir='.'):
         """See class docstring."""
+
         super().__init__(config, name=name, basedir=basedir)
+
 
 
     def _build(self):
@@ -337,7 +343,7 @@ class StarDist3D(StarDistBase):
         elif self.config.backbone == "resnet":
             return self._build_resnet()
         elif self.config.backbone == "n2v":
-            return self.build_n2v()
+            return self._build_n2v()
         else:
             raise NotImplementedError(self.config.backbone)
 
@@ -383,7 +389,7 @@ class StarDist3D(StarDistBase):
         else:
             return Model([input_img], [output_prob,output_dist])
 
-    def get_output_layer(model, layer_name):
+    def get_output_layer(self, model, layer_name):
         # get the symbolic outputs of each "key" layer (we gave them unique names).
         layer_dict = dict([(layer.name, layer) for layer in model.layers])
         layer = layer_dict[layer_name]
@@ -392,20 +398,22 @@ class StarDist3D(StarDistBase):
     def _build_n2v(self):
         assert self.config.backbone == 'n2v'
         unet_kwargs = {k[len('unet_'):]:v for (k,v) in vars(self.config).items() if k.startswith('unet_')}
-
-        model = N2V(config=None, name=self.config.model_name, basedir=self.config.basedir)
+        model = N2V(None, name=self.config.n2vmodel_name, basedir=self.config.n2vbasedir)
         model.load_weights("weights_best.h5")
-        
+                
         kerasmodel = model.keras_model
-        last_unet_layer = get_output_layer(kerasmodel, "channel_0up_level_0_no_"+str(self.config.unet_n_conv_per_depth))
-        first_unet_layer = get_output_layer(kerasmodel, "input")
-        unet_base = K.function([first_unet_layer.input], [last_unet_layer.output])
-
-        
+        input_img = Input(self.config.net_input_shape, name="input")
+        last_unet_layer = self.get_output_layer(kerasmodel, "channel_0up_level_0_no_"+str(self.config.unet_n_conv_per_depth))
+        first_unet_layer = self.get_output_layer(kerasmodel, "lambda")
+        get_output = Model(inputs=[first_unet_layer.input], outputs=[last_unet_layer.output])
+        #K.function([first_unet_layer.input], [last_unet_layer.output])
+        unet_base = get_output([input_img])
+                   
+       
         #input_img = Input(self.config.net_input_shape, name='input')
 
         #unet_base = unet_block(**unet_kwargs)(input_img)
-        
+
         if self.config.net_conv_after_unet > 0:
             unet = Conv3D(self.config.net_conv_after_unet, self.config.unet_kernel_size,
                           name='features', padding='same', activation=self.config.unet_activation)(unet_base)
@@ -696,7 +704,7 @@ class StarDist3D(StarDistBase):
 
 
     def _axes_div_by(self, query_axes):
-        if self.config.backbone == "unet":
+        if self.config.backbone == "unet" or self.config.backbone == "n2v":
             query_axes = axes_check_and_normalize(query_axes)
             assert len(self.config.unet_pool) == len(self.config.grid)
             div_by = dict(zip(
